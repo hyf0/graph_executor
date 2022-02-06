@@ -1,11 +1,11 @@
-use futures::Future;
+use async_trait::async_trait;
+
 
 pub trait Executable {
   fn exec(&mut self);
 }
 
+#[async_trait]
 pub trait AsyncExecutable {
-  type ExecResult: Future<Output = ()>;
-
-  fn exec(&mut self) -> Self::ExecResult;
+  async fn exec(&mut self) -> anyhow::Result<()>;
 }

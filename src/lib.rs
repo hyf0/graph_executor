@@ -5,4 +5,5 @@ mod traits;
 mod shared;
 pub use traits::*;
 pub use synced::GraphExecutor;
+pub use asynced::AsyncGraphExecutor;
 

@@ -1,29 +1,23 @@
-use dashmap::DashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
-use futures::Future;
-use priority_queue::PriorityQueue;
+use crate::shared::NodeInfo;
+use crate::AsyncExecutable;
+use futures::future::select_all;
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-use crate::shared::NodeInfo;
-use crate::AsyncExecutable;
 
 #[derive(Debug)]
 pub struct AsyncGraphExecutor<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
-    node_infos: Arc<DashMap<Key, NodeInfo<Key>>>,
+    node_infos: HashMap<Key, NodeInfo<Key>>,
     pub nodes: HashMap<Key, Node>,
-    pub todo_queue: Arc<Mutex<PriorityQueue<Key, usize>>>,
     node_keys_with_no_deps: Vec<Key>,
 }
 
-impl<Key: Eq + Hash + Clone + Sync + Send, Node: AsyncExecutable + Send>
+impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
     AsyncGraphExecutor<Key, Node>
 {
     pub fn new(nodes: HashMap<Key, Node>, edges: Vec<(Key, Key)>) -> Self {
-        let node_infos = nodes
+        let mut node_infos = nodes
             .iter()
             .map(|(key, _node)| {
                 (
@@ -36,12 +30,12 @@ impl<Key: Eq + Hash + Clone + Sync + Send, Node: AsyncExecutable + Send>
                     },
                 )
             })
-            .collect::<DashMap<_, _>>();
+            .collect::<HashMap<_, _>>();
         log::debug!("make node_infos");
         edges.iter().for_each(|(subject_key, dependent_key)| {
-            let mut subject_info = node_infos.get_mut(subject_key).unwrap();
+            let subject_info = node_infos.get_mut(subject_key).unwrap();
             subject_info.depended_on_by.insert(dependent_key.clone());
-            let mut dependent_info = node_infos.get_mut(dependent_key).unwrap();
+            let dependent_info = node_infos.get_mut(dependent_key).unwrap();
             dependent_info.depends_on.insert(subject_key.clone());
             //  }
         });
@@ -49,46 +43,55 @@ impl<Key: Eq + Hash + Clone + Sync + Send, Node: AsyncExecutable + Send>
 
         let node_keys_with_no_deps = node_infos
             .iter()
-            .filter(|node_info| node_info.depends_on.len() == 0)
-            .map(|node_info| node_info.key().clone())
+            .filter(|(_, node_info)| node_info.depends_on.len() == 0)
+            .map(|(key, _)| key.clone())
             .collect();
 
         let me = Self {
             nodes,
-            node_infos: Arc::new(node_infos),
+            node_infos: node_infos,
             node_keys_with_no_deps,
-            // graph,
-            todo_queue: Default::default(),
         };
         me
     }
 
     pub async fn exec(&mut self) {
-        let futures_unordered = FuturesUnordered::new();
-
-        log::debug!("start exec");
+        // println!("nodeinfos {:#?}", self.node_infos);
+        println!("start exec");
+        let mut futures = vec![];
         {
-            let mut todo_queue = self.todo_queue.lock().unwrap();
             self.node_keys_with_no_deps.iter().for_each(|key| {
-                todo_queue.push(key.clone(), 0);
+                let mut node = self.nodes.remove(&key).unwrap();
+                futures.push(
+                    async move {
+                        let result = node.exec().await;
+                        (key.clone(), result)
+                    }
+                    .boxed(),
+                );
             });
         }
-        while let Some((key, _)) = self.todo_queue.lock().unwrap().pop() {
-            let mut node = self.nodes.remove(&key).unwrap();
-            let nodes_info = self.node_infos.clone();
-            let todo_queue = self.todo_queue.clone();
-            futures_unordered.push(async move {
-                let result = node.exec().await;
-                let info = nodes_info.get_mut(&key).unwrap();
-                info.depended_on_by.iter().for_each(|parent_key| {
-                    let mut parent = nodes_info.get_mut(&parent_key).unwrap();
-                    parent.depends_on.remove(&key);
+        while futures.len() > 0 {
+            let ((finished_task_key, _result), idx, _remains) = select_all(&mut futures).await;
+            futures.remove(idx);
+            let info = self.node_infos.get_mut(&finished_task_key).unwrap();
+            info.depended_on_by
+                .clone()
+                .into_iter()
+                .for_each(|parent_key| {
+                    let parent = self.node_infos.get_mut(&parent_key).unwrap();
+                    parent.depends_on.remove(&finished_task_key);
                     if parent.depends_on.len() == 0 {
-                        todo_queue.lock().unwrap().push(parent_key.clone(), 0);
+                        let mut node = self.nodes.remove(&parent_key).unwrap();
+                        futures.push(
+                            async move {
+                                let result = node.exec().await;
+                                (parent_key.clone(), result)
+                            }
+                            .boxed(),
+                        );
                     }
                 });
-                result
-            });
         }
     }
 }

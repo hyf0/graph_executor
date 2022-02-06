@@ -8,7 +8,7 @@ An multithreaded computation scheduler. Execute your tasks in parallel with base
   - [ ] Concurrency Limiter
   - [ ] Priority
 - Asynced API 
-  - [ ] Parallel execution
+  - [x] Parallel execution
   - [ ] Concurrency Limiter
   - [ ] Priority
 
