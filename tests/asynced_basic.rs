@@ -56,7 +56,7 @@ fn basic() {
             ("putOnShorts", "putOnShoes"),
         ],
     );
-    // futures::executor::block_on();
+    // futures::executor::block_on(runner.exec());
     tokio::runtime::Builder::new_multi_thread()
     .enable_all()
     .build()

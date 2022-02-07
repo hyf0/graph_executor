@@ -1,10 +1,10 @@
-use crate::shared::NodeInfo;
+use crate::shared::{ExecOptions, NodeInfo};
 use crate::AsyncExecutable;
 use futures::future::select_all;
 use futures::FutureExt;
 use petgraph::dot::Dot;
 use petgraph::graph::NodeIndex;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;
 use std::hash::Hash;
 
@@ -17,6 +17,23 @@ pub struct AsyncGraphExecutor<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
     key_to_graph_idx: HashMap<Key, NodeIndex>,
 }
 
+#[derive(PartialEq, Eq)]
+struct Ordered<T> {
+    value: T,
+    order: usize,
+}
+
+impl<T: PartialEq> PartialOrd for Ordered<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.order.partial_cmp(&other.order)
+    }
+}
+
+impl<T: Eq> Ord for Ordered<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order.cmp(&other.order)
+    }
+}
 impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
     AsyncGraphExecutor<Key, Node>
 {
@@ -78,41 +95,53 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
         }
     }
 
-    pub async fn exec(&mut self) {
+    #[inline]
+    pub async fn exec(self) {
+        self.exec_with(Default::default()).await
+    }
+
+    pub async fn exec_with(mut self, options: ExecOptions) {
         // println!("nodeinfos {:#?}", self.node_infos);
         println!("start exec");
-        let mut futures = vec![];
-        {
-            self.node_keys_with_no_deps.iter().for_each(|key| {
-                let mut node = self.nodes.remove(&key).unwrap();
-                futures.push(
+        let mut running_futures = vec![];
+        let mut todo_queue = self
+            .node_keys_with_no_deps
+            .iter()
+            .cloned()
+            .map(|key| Ordered {
+                value: key,
+                order: 0,
+            })
+            .collect::<BinaryHeap<_>>();
+
+        while running_futures.len() > 0 || todo_queue.len() > 0 {
+            while running_futures.len() < options.concurrency && todo_queue.len() > 0 {
+                let key = todo_queue.pop().unwrap();
+                let mut node = self.nodes.remove(&key.value).unwrap();
+                running_futures.push(
                     async move {
                         let result = node.exec().await;
-                        (key.clone(), result)
+                        (key, result)
                     }
                     .boxed(),
                 );
-            });
-        }
-        while futures.len() > 0 {
-            let ((finished_task_key, _result), idx, _remains) = select_all(&mut futures).await;
-            futures.remove(idx);
-            let info = self.node_infos.get_mut(&finished_task_key).unwrap();
+            }
+
+            let ((finished_task_key, _result), idx, _remains) =
+                select_all(&mut running_futures).await;
+            running_futures.remove(idx);
+            let info = self.node_infos.get_mut(&finished_task_key.value).unwrap();
             info.depended_on_by
                 .clone()
                 .into_iter()
                 .for_each(|parent_key| {
                     let parent = self.node_infos.get_mut(&parent_key).unwrap();
-                    parent.depends_on.remove(&finished_task_key);
+                    parent.depends_on.remove(&finished_task_key.value);
                     if parent.depends_on.len() == 0 {
-                        let mut node = self.nodes.remove(&parent_key).unwrap();
-                        futures.push(
-                            async move {
-                                let result = node.exec().await;
-                                (parent_key.clone(), result)
-                            }
-                            .boxed(),
-                        );
+                        todo_queue.push(Ordered {
+                            value: parent_key.clone(),
+                            order: 0,
+                        })
                     }
                 });
         }
