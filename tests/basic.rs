@@ -18,7 +18,7 @@ static RECORDS: Lazy<Mutex<Vec<&'static str>>> = Lazy::new(|| Mutex::new(vec![])
 
 impl Executable for HunmanBehavior {
     fn exec(&mut self) {
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(100));
         RECORDS.lock().unwrap().push(self.id);
         println!("exec {}", self.id)
     }

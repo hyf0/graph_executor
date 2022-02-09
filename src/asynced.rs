@@ -4,15 +4,21 @@ use futures::future::select_all;
 use futures::FutureExt;
 use petgraph::dot::Dot;
 use petgraph::graph::NodeIndex;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
-#[derive(Debug)]
+pub(crate) struct Task<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
+    pub node: Node,
+    pub depends_on: HashSet<Key>,
+    pub depended_on_by: HashSet<Key>,
+    pub failed: bool,
+    pub priority: usize,
+}
+
 pub struct AsyncGraphExecutor<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
-    node_infos: HashMap<Key, NodeInfo<Key>>,
-    pub nodes: HashMap<Key, Node>,
-    node_keys_with_no_deps: Vec<Key>,
+    pub(crate) tasks: HashMap<Key, Task<Key, Node>>,
+    task_keys_with_no_deps: Vec<Key>,
     graph: petgraph::graph::DiGraph<Key, ()>,
     key_to_graph_idx: HashMap<Key, NodeIndex>,
 }
@@ -38,31 +44,32 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
     AsyncGraphExecutor<Key, Node>
 {
     pub fn new(nodes: HashMap<Key, Node>, edges: Vec<(Key, Key)>) -> Self {
-        let mut node_infos = nodes
-            .iter()
+        let mut tasks: HashMap<Key, Task<Key, Node>> = nodes
+            .into_iter()
             .map(|(key, node)| {
                 (
-                    key.clone(),
-                    NodeInfo::<Key> {
+                    key,
+                    Task {
+                        node,
                         depended_on_by: Default::default(),
                         depends_on: Default::default(),
                         failed: false,
-                        priority: node.get_priority(),
+                        priority: 0,
                     },
                 )
             })
-            .collect::<HashMap<Key, NodeInfo<Key>>>();
+            .collect();
 
         log::debug!("make node_infos");
         edges.iter().for_each(|(subject_key, dependent_key)| {
-            let subject_info = node_infos.get_mut(subject_key).unwrap();
+            let subject_info = tasks.get_mut(subject_key).unwrap();
             subject_info.depended_on_by.insert(dependent_key.clone());
-            let dependent_info = node_infos.get_mut(dependent_key).unwrap();
+            let dependent_info = tasks.get_mut(dependent_key).unwrap();
             dependent_info.depends_on.insert(subject_key.clone());
         });
         log::debug!("make deps");
 
-        let node_keys_with_no_deps = node_infos
+        let task_keys_with_no_deps = tasks
             .iter()
             .filter(|(_, node_info)| node_info.depends_on.len() == 0)
             .map(|(key, _)| key.clone())
@@ -71,7 +78,7 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
         let mut graph: petgraph::graph::DiGraph<Key, ()> = Default::default();
         let mut key_to_graph_idx: HashMap<Key, NodeIndex> = Default::default();
 
-        nodes.keys().for_each(|key| {
+        tasks.keys().for_each(|key| {
             if !key_to_graph_idx.contains_key(key) {
                 let idx = graph.add_node(key.clone());
                 key_to_graph_idx.insert(key.clone(), idx);
@@ -87,25 +94,26 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
         println!("{:#?}", Dot::new(&graph));
 
         Self {
-            nodes,
+            tasks,
             graph,
-            node_infos,
-            node_keys_with_no_deps,
+            // node_infos,
+            task_keys_with_no_deps,
             key_to_graph_idx,
         }
     }
 
     #[inline]
-    pub async fn exec(&mut self) {
+    pub async fn exec(&mut self) -> anyhow::Result<()> {
         self.exec_with(Default::default()).await
     }
 
-    pub async fn exec_with(&mut self, options: ExecOptions) {
-        // println!("nodeinfos {:#?}", self.node_infos);
-        println!("start exec");
+    pub async fn exec_with(&mut self, options: ExecOptions) -> anyhow::Result<()> {
+        assert!(options.concurrency > 0);
+
         let mut running_futures = vec![];
+
         let mut todo_queue = self
-            .node_keys_with_no_deps
+            .task_keys_with_no_deps
             .iter()
             .cloned()
             .map(|key| Ordered {
@@ -117,34 +125,46 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
         while running_futures.len() > 0 || todo_queue.len() > 0 {
             while running_futures.len() < options.concurrency && todo_queue.len() > 0 {
                 let key = todo_queue.pop().unwrap();
-                let mut node = self.nodes.remove(&key.value).unwrap();
+                let mut task = self.tasks.remove(&key.value).unwrap();
                 running_futures.push(
                     async move {
-                        let result = node.exec().await;
-                        (node, key, result)
+                        if !task.failed {
+                            let result = task.node.exec().await;
+                            task.failed = result.is_err();
+                        }
+                        (key, task)
                     }
                     .boxed(),
                 );
             }
 
-            let ((node, finished_task_key, _result), idx, _remains) =
+
+            let ((finished_task_key, finished_task), idx, _remains) =
                 select_all(&mut running_futures).await;
-            self.nodes.insert(finished_task_key.value.clone(), node);
             running_futures.remove(idx);
-            let info = self.node_infos.get_mut(&finished_task_key.value).unwrap();
-            info.depended_on_by
-                .clone()
-                .into_iter()
-                .for_each(|parent_key| {
-                    let parent = self.node_infos.get_mut(&parent_key).unwrap();
-                    parent.depends_on.remove(&finished_task_key.value);
-                    if parent.depends_on.len() == 0 {
+            if finished_task.failed && !options.continue_on_fail {
+                panic!("failed")
+            }
+
+            finished_task
+                .depended_on_by
+                .iter()
+                .for_each(|consumer_key| {
+                    let consumer = self.tasks.get_mut(&consumer_key).unwrap();
+                    if finished_task.failed {
+                        consumer.failed = finished_task.failed
+                    }
+                    consumer.depends_on.remove(&finished_task_key.value);
+                    if consumer.depends_on.len() == 0 {
                         todo_queue.push(Ordered {
-                            value: parent_key.clone(),
+                            value: consumer_key.clone(),
                             order: 0,
                         })
                     }
                 });
+
+            self.tasks.insert(finished_task_key.value, finished_task);
         }
+        Ok(())
     }
 }
