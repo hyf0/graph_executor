@@ -96,11 +96,11 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
     }
 
     #[inline]
-    pub async fn exec(self) {
+    pub async fn exec(&mut self) {
         self.exec_with(Default::default()).await
     }
 
-    pub async fn exec_with(mut self, options: ExecOptions) {
+    pub async fn exec_with(&mut self, options: ExecOptions) {
         // println!("nodeinfos {:#?}", self.node_infos);
         println!("start exec");
         let mut running_futures = vec![];
@@ -121,14 +121,15 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
                 running_futures.push(
                     async move {
                         let result = node.exec().await;
-                        (key, result)
+                        (node, key, result)
                     }
                     .boxed(),
                 );
             }
 
-            let ((finished_task_key, _result), idx, _remains) =
+            let ((node, finished_task_key, _result), idx, _remains) =
                 select_all(&mut running_futures).await;
+            self.nodes.insert(finished_task_key.value.clone(), node);
             running_futures.remove(idx);
             let info = self.node_infos.get_mut(&finished_task_key.value).unwrap();
             info.depended_on_by
