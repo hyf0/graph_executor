@@ -1,14 +1,17 @@
-use crate::shared::{ExecOptions, NodeInfo};
+use crate::shared::ExecOptions;
 use crate::AsyncExecutable;
 use futures::future::select_all;
 use futures::FutureExt;
-use petgraph::dot::Dot;
+use petgraph::algo::toposort;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
+use petgraph::EdgeDirection;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 
-pub(crate) struct Task<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
+#[derive(Debug)]
+pub(crate) struct Task<Key: Hash + Eq + Clone + Debug, Node: AsyncExecutable + Debug> {
     pub node: Node,
     pub depends_on: HashSet<Key>,
     pub depended_on_by: HashSet<Key>,
@@ -16,14 +19,12 @@ pub(crate) struct Task<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
     pub priority: usize,
 }
 
-pub struct AsyncGraphExecutor<Key: Hash + Eq + Clone, Node: AsyncExecutable> {
+pub struct AsyncGraphExecutor<Key: Hash + Eq + Clone + Debug, Node: AsyncExecutable + Debug> {
     pub(crate) tasks: HashMap<Key, Task<Key, Node>>,
     task_keys_with_no_deps: Vec<Key>,
-    graph: petgraph::graph::DiGraph<Key, ()>,
-    key_to_graph_idx: HashMap<Key, NodeIndex>,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 struct Ordered<T> {
     value: T,
     order: usize,
@@ -40,7 +41,7 @@ impl<T: Eq> Ord for Ordered<T> {
         self.order.cmp(&other.order)
     }
 }
-impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
+impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send + Debug>
     AsyncGraphExecutor<Key, Node>
 {
     pub fn new(nodes: HashMap<Key, Node>, edges: Vec<(Key, Key)>) -> Self {
@@ -50,40 +51,61 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
                 (
                     key,
                     Task {
+                        priority: 0,
                         node,
                         depended_on_by: Default::default(),
                         depends_on: Default::default(),
                         failed: false,
-                        priority: 0,
                     },
                 )
             })
             .collect();
 
-        log::debug!("make node_infos");
         edges.iter().for_each(|(subject_key, dependent_key)| {
             let subject_info = tasks.get_mut(subject_key).unwrap();
             subject_info.depended_on_by.insert(dependent_key.clone());
             let dependent_info = tasks.get_mut(dependent_key).unwrap();
             dependent_info.depends_on.insert(subject_key.clone());
         });
-        log::debug!("make deps");
 
         let task_keys_with_no_deps = tasks
             .iter()
             .filter(|(_, node_info)| node_info.depends_on.len() == 0)
             .map(|(key, _)| key.clone())
-            .collect();
+            .collect::<Vec<_>>();
 
-        let mut graph: petgraph::graph::DiGraph<Key, ()> = Default::default();
-        let mut key_to_graph_idx: HashMap<Key, NodeIndex> = Default::default();
+        let mut graph: petgraph::graph::DiGraph<&Key, ()> = Default::default();
+        let mut key_to_graph_idx: HashMap<&Key, NodeIndex> = Default::default();
 
         tasks.keys().for_each(|key| {
             if !key_to_graph_idx.contains_key(key) {
-                let idx = graph.add_node(key.clone());
-                key_to_graph_idx.insert(key.clone(), idx);
+                let idx = graph.add_node(&key);
+                key_to_graph_idx.insert(&key, idx);
             }
         });
+        edges.iter().for_each(|(from, to)| {
+            graph.add_edge(
+                *key_to_graph_idx.get(from).unwrap(),
+                *key_to_graph_idx.get(to).unwrap(),
+                (),
+            );
+        });
+
+        let mut sorted = toposort(&graph, None).unwrap();
+
+        while let Some(idx) = sorted.pop() {
+            let max_p = graph
+                .edges_directed(idx, EdgeDirection::Outgoing)
+                .map(|edge| edge.target())
+                .map(|idx| graph[idx])
+                .map(|key| tasks.get(key).unwrap().node.get_priority())
+                .max()
+                .unwrap_or(0);
+            let key = graph[idx];
+            let task = tasks.get(key).unwrap();
+            let p = max_p + task.node.get_priority();
+            unsafe { (*(task as *const Task<Key, Node> as *mut Task<Key, Node>)).priority = p }
+        }
 
         edges.iter().for_each(|(from, to)| {
             let from_idx = key_to_graph_idx.get(from).unwrap();
@@ -91,14 +113,9 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
             graph.add_edge(*from_idx, *to_idx, ());
         });
 
-        println!("{:#?}", Dot::new(&graph));
-
         Self {
             tasks,
-            graph,
-            // node_infos,
             task_keys_with_no_deps,
-            key_to_graph_idx,
         }
     }
 
@@ -117,12 +134,13 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
             .iter()
             .cloned()
             .map(|key| Ordered {
+                order: self.tasks.get(&key).unwrap().priority,
                 value: key,
-                order: 0,
             })
             .collect::<BinaryHeap<_>>();
 
         while running_futures.len() > 0 || todo_queue.len() > 0 {
+            // println!("todo_queue {:#?}", todo_queue);
             while running_futures.len() < options.concurrency && todo_queue.len() > 0 {
                 let key = todo_queue.pop().unwrap();
                 let mut task = self.tasks.remove(&key.value).unwrap();
@@ -137,7 +155,6 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
                     .boxed(),
                 );
             }
-
 
             let ((finished_task_key, finished_task), idx, _remains) =
                 select_all(&mut running_futures).await;
@@ -158,7 +175,7 @@ impl<Key: Eq + Hash + Clone + Sync + Send + Debug, Node: AsyncExecutable + Send>
                     if consumer.depends_on.len() == 0 {
                         todo_queue.push(Ordered {
                             value: consumer_key.clone(),
-                            order: 0,
+                            order: consumer.priority,
                         })
                     }
                 });

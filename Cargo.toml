@@ -2,13 +2,16 @@
 name = "graph_executor"
 version = "0.1.0"
 edition = "2021"
+description = "graph_executor"
+authors = ["Yunfei He <i.heyunfei@gmail.com>"]
+license = "MIT"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 petgraph = "0.6.0"
 dashmap = "5.0.0"
-priority-queue = "1.2.1"
 log = "0.4"
 futures = "0.3.19"
 anyhow = "1.0.53"

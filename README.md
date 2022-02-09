@@ -4,12 +4,15 @@ An multithreaded computation scheduler. Execute your tasks in parallel with base
 # Features
 
 - Synced API
-  - [x] Parallel execution
+  - [ ] Parallel execution
   - [ ] Concurrency Limiter
   - [ ] Priority
+
 - Asynced API 
   - [x] Parallel execution
   - [x] Concurrency Limiter
-  - [ ] Priority
+  - [x] Priority
+
+---
 
 Inspired by [p-graph](https://github.com/microsoft/p-graph)

@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use priority_queue::PriorityQueue;
 use std::collections::{HashMap};
 use std::fmt::Debug;
 use std::hash::Hash;

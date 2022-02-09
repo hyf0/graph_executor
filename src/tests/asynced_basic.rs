@@ -17,36 +17,31 @@ struct TestNode {
     records: Arc<Mutex<CallRecords>>,
     rejected: bool,
     called: bool,
+    priority: usize,
 }
 
 impl TestNode {
-    pub fn new(id: &'static str, records: Arc<Mutex<CallRecords>>, reject: bool) -> Self {
+    pub fn new(
+        id: &'static str,
+        records: Arc<Mutex<CallRecords>>,
+        reject: bool,
+        priority: usize,
+    ) -> Self {
         Self {
             id,
             records,
             rejected: reject,
             called: false,
+            priority,
         }
-    }
-}
-
-#[derive(Debug)]
-struct SuperError;
-
-impl fmt::Display for SuperError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SuperError is here!")
-    }
-}
-
-impl Error for SuperError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        None
     }
 }
 
 #[async_trait]
 impl AsyncExecutable for TestNode {
+    fn get_priority(&self) -> usize {
+        self.priority
+    }
     async fn exec(&mut self) -> anyhow::Result<()> {
         assert!(!self.called);
         let records = self.records.clone();
@@ -73,6 +68,21 @@ impl AsyncExecutable for TestNode {
     }
 }
 
+#[derive(Debug)]
+struct SuperError;
+
+impl fmt::Display for SuperError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SuperError is here!")
+    }
+}
+
+impl Error for SuperError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct CallRecords {
     pub max_call: usize,
@@ -95,7 +105,13 @@ impl TestSuite {
 
     pub fn add_node(&mut self, id: &'static str) -> &mut Self {
         self.nodes
-            .push(TestNode::new(id, self.records.clone(), false));
+            .push(TestNode::new(id, self.records.clone(), false, 0));
+        self
+    }
+
+    pub fn add_node_with_priority(&mut self, id: &'static str, priority: usize) -> &mut Self {
+        self.nodes
+            .push(TestNode::new(id, self.records.clone(), false, priority));
         self
     }
 
@@ -103,14 +119,14 @@ impl TestSuite {
         self.nodes.append(
             &mut ids
                 .into_iter()
-                .map(|id| TestNode::new(id, self.records.clone(), false))
+                .map(|id| TestNode::new(id, self.records.clone(), false, 0))
                 .collect(),
         );
         self
     }
     pub fn add_rejected_node(&mut self, id: &'static str) -> &mut Self {
         self.nodes
-            .push(TestNode::new(id, self.records.clone(), true));
+            .push(TestNode::new(id, self.records.clone(), true, 0));
         self
     }
 
@@ -352,10 +368,78 @@ fn correctly_schedules_tasks_that_have_more_than_one_dependency() {
     assert_ordering(&t.records.lock().unwrap().exec_records, "C", "D");
 }
 
-fn should_schedule_high_priority_tasks_and_dependencies_before_lower_priority_tasks() {}
+#[test]
+fn should_schedule_high_priority_tasks_and_dependencies_before_lower_priority_tasks() {
+    let mut t = TestSuite::build();
+    let f = t
+        .add_nodes(vec!["A", "B", "C", "D", "E"])
+        .add_node_with_priority("F", 16)
+        //      A
+        //  B   C   D
+        //    |E F|
+        .add_edges(vec![
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("C", "E"),
+            ("C", "F"),
+        ])
+        .run_with(ExecOptions {
+            concurrency: 1,
+            ..Default::default()
+        });
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+        .unwrap();
+
+    assert_ordering(&t.records.lock().unwrap().exec_records, "C", "B");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "C", "D");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "F", "E");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "F", "B");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "F", "D");
+}
+
+#[test]
 fn should_schedule_high_priority_tasks_and_dependencies_before_lower_priority_tasks_when_max_concurrency_is_greater_than_1(
 ) {
+    let mut t = TestSuite::build();
+    let f = t
+        .add_nodes(vec!["A"])
+        .add_node_with_priority("B", 16)
+        .add_node_with_priority("C", 4)
+        .add_node_with_priority("D", 4)
+        .add_node_with_priority("E", 12)
+        .add_node_with_priority("F", 16)
+        //      A
+        //  B   C   D
+        //    |E F|
+        .add_edges(vec![
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("C", "E"),
+            ("C", "F"),
+        ])
+        .run_with(ExecOptions {
+            concurrency: 1,
+            ..Default::default()
+        });
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+        .unwrap();
+
+    assert_ordering(&t.records.lock().unwrap().exec_records, "C", "B");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "C", "D");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "B", "D");
+    assert_ordering(&t.records.lock().unwrap().exec_records, "F", "E");
 }
 
 fn assert_ordering<T: AsRef<str>>(records: &[T], first: &str, second: &str) {
