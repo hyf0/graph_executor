@@ -9,7 +9,7 @@ An multithreaded computation scheduler. Execute your tasks in parallel with base
   - [ ] Priority
 - Asynced API 
   - [x] Parallel execution
-  - [ ] Concurrency Limiter
+  - [x] Concurrency Limiter
   - [ ] Priority
 
 Inspired by [p-graph](https://github.com/microsoft/p-graph)
