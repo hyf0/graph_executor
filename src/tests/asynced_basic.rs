@@ -99,7 +99,7 @@ impl TestSuite {
         self
     }
 
-    pub fn add_nodes(&mut self, mut ids: Vec<&'static str>) -> &mut Self {
+    pub fn add_nodes(&mut self, ids: Vec<&'static str>) -> &mut Self {
         self.nodes.append(
             &mut ids
                 .into_iter()
@@ -113,7 +113,7 @@ impl TestSuite {
             .push(TestNode::new(id, self.records.clone(), true));
         self
     }
-    
+
     // pub fn add_edge(&mut self, edge: (&'static str, &'static str)) -> &mut Self {
     //     self.edges.push(edge);
     //     self
