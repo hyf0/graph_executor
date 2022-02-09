@@ -1,6 +1,6 @@
 [package]
 name = "graph_executor"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "graph_executor"
 authors = ["Yunfei He <i.heyunfei@gmail.com>"]
