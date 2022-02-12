@@ -4,11 +4,13 @@ An multithreaded computation scheduler. Execute your tasks in parallel with base
 # Features
 
 - Synced API
+  - [ ] circle detection
   - [ ] Parallel execution
   - [ ] Concurrency Limiter
   - [ ] Priority
 
 - Asynced API 
+  - [ ] circle detection
   - [x] Parallel execution
   - [x] Concurrency Limiter
   - [x] Priority
